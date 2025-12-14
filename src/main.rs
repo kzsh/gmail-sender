@@ -59,6 +59,8 @@ enum Commands {
 enum ConfigCommands {
     /// Initialize configuration directory
     Init,
+    /// Check configuration setup
+    Check,
     /// Install the executable to system path
     Install {
         /// Create symlink to ~/.local/bin/ instead of copying to /usr/local/bin/
@@ -118,6 +120,9 @@ async fn main() -> Result<()> {
                 match config_command {
                     ConfigCommands::Init => {
                         return handle_init();
+                    }
+                    ConfigCommands::Check => {
+                        return handle_check();
                     }
                     ConfigCommands::Install { link } => {
                         return handle_install(link);
@@ -195,6 +200,115 @@ fn handle_init() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Handle the check subcommand
+fn handle_check() -> Result<()> {
+    let config_dir = get_config_dir();
+    let data_dir = get_data_dir();
+    let client_secret_path = get_config_path("client_secret.json");
+    let token_cache_path = get_data_path("token_cache.json");
+
+    let mut all_ok = true;
+
+    println!("Checking gmail-sender configuration...\n");
+
+    // Check config directory
+    print!("Config directory ({:?}): ", config_dir);
+    if config_dir.exists() {
+        println!("✓ exists");
+    } else {
+        println!("✗ missing");
+        println!("  Run 'gmail-sender config init' to create it");
+        all_ok = false;
+    }
+
+    // Check data directory
+    print!("Data directory ({:?}): ", data_dir);
+    if data_dir.exists() {
+        println!("✓ exists");
+    } else {
+        println!("✗ missing");
+        println!("  Run 'gmail-sender config init' to create it");
+        all_ok = false;
+    }
+
+    // Check client_secret.json existence
+    print!("\nClient secret ({:?}): ", client_secret_path);
+    if !client_secret_path.exists() {
+        println!("✗ not found");
+        println!("  Download OAuth2 credentials from Google Cloud Console");
+        println!("  and save as {:?}", client_secret_path);
+        all_ok = false;
+    } else {
+        // Validate the JSON structure
+        match fs::read_to_string(&client_secret_path) {
+            Ok(content) => {
+                match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(json) => {
+                        // Check for required fields in OAuth2 client secret
+                        let has_installed = json.get("installed").is_some();
+                        let has_web = json.get("web").is_some();
+
+                        if has_installed || has_web {
+                            let client_type = if has_installed {
+                                json.get("installed")
+                            } else {
+                                json.get("web")
+                            };
+
+                            if let Some(client) = client_type {
+                                let has_client_id = client.get("client_id").is_some();
+                                let has_client_secret = client.get("client_secret").is_some();
+
+                                if has_client_id && has_client_secret {
+                                    println!("✓ valid");
+                                } else {
+                                    println!("✗ invalid (missing client_id or client_secret)");
+                                    all_ok = false;
+                                }
+                            } else {
+                                println!("✗ invalid structure");
+                                all_ok = false;
+                            }
+                        } else {
+                            println!("✗ invalid (missing 'installed' or 'web' section)");
+                            println!("  Make sure you downloaded a Desktop app or Web app credential");
+                            all_ok = false;
+                        }
+                    }
+                    Err(e) => {
+                        println!("✗ invalid JSON: {}", e);
+                        all_ok = false;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("✗ cannot read: {}", e);
+                all_ok = false;
+            }
+        }
+    }
+
+    // Check token cache (optional, just informational)
+    print!("\nToken cache ({:?}): ", token_cache_path);
+    if token_cache_path.exists() {
+        println!("✓ exists (you're authenticated)");
+    } else {
+        println!("⚬ not found (will be created on first run)");
+    }
+
+    println!("\n{}", if all_ok {
+        "✓ Configuration is valid! You're ready to send emails."
+    } else {
+        "✗ Configuration has issues. Please fix the problems above."
+    });
+
+    if all_ok {
+        Ok(())
+    } else {
+        anyhow::bail!("Configuration check failed")
+    }
 }
 
 /// Handle the install subcommand

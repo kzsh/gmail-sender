@@ -150,6 +150,9 @@ gmail-sender \
 # Initialize config directory
 gmail-sender config init
 
+# Check configuration validity
+gmail-sender config check
+
 # Install the binary
 gmail-sender config install [--link]
 
@@ -175,6 +178,7 @@ Options:
 Subcommands:
   config                           Configuration commands
     init                           Initialize configuration directory
+    check                          Check configuration setup
     install                        Install the executable to system path
     completions                    Generate shell completions
 ```
@@ -202,7 +206,9 @@ You can override these paths with `--client-secret` and `--token-cache` flags.
 
 ### "Failed to read client secret file"
 
-Make sure you've downloaded the OAuth2 credentials JSON from Google Cloud Console and saved it in `~/.config/gmail-sender/client_secret.json` (or run `gmail-sender config init` to see the expected path).
+Make sure you've downloaded the OAuth2 credentials JSON from Google Cloud Console and saved it in `~/.config/gmail-sender/client_secret.json`.
+
+Run `gmail-sender config check` to diagnose configuration issues, or `gmail-sender config init` to see the expected paths.
 
 ### "Access blocked: This app's request is invalid"
 
