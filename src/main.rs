@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 use dialoguer::Input;
 use google_gmail1::{
     api::Message,
@@ -36,13 +37,13 @@ struct Args {
     #[arg(short, long, global = true)]
     attachment: Vec<PathBuf>,
 
-    /// Path to OAuth2 client secret JSON file
-    #[arg(long, default_value = "client_secret.json", global = true)]
-    client_secret: PathBuf,
+    /// Path to OAuth2 client secret JSON file (defaults to $XDG_CONFIG_HOME/gmail-sender/client_secret.json)
+    #[arg(long, global = true)]
+    client_secret: Option<PathBuf>,
 
-    /// Path to store OAuth2 tokens
-    #[arg(long, default_value = "token_cache.json", global = true)]
-    token_cache: PathBuf,
+    /// Path to store OAuth2 tokens (defaults to $XDG_DATA_HOME/gmail-sender/token_cache.json)
+    #[arg(long, global = true)]
+    token_cache: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -56,12 +57,54 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
+    /// Initialize configuration directory
+    Init,
     /// Install the executable to system path
     Install {
         /// Create symlink to ~/.local/bin/ instead of copying to /usr/local/bin/
         #[arg(long)]
         link: bool,
     },
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+}
+
+/// Get the XDG config directory for gmail-sender
+fn get_config_dir() -> PathBuf {
+    let config_home = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .expect("Failed to find home directory")
+                .join(".config")
+        });
+    config_home.join("gmail-sender")
+}
+
+/// Get the XDG data directory for gmail-sender
+fn get_data_dir() -> PathBuf {
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .expect("Failed to find home directory")
+                .join(".local/share")
+        });
+    data_home.join("gmail-sender")
+}
+
+/// Get a config file path within the XDG config directory
+fn get_config_path(filename: &str) -> PathBuf {
+    get_config_dir().join(filename)
+}
+
+/// Get a data file path within the XDG data directory
+fn get_data_path(filename: &str) -> PathBuf {
+    get_data_dir().join(filename)
 }
 
 #[tokio::main]
@@ -73,8 +116,14 @@ async fn main() -> Result<()> {
         match command {
             Commands::Config { config_command } => {
                 match config_command {
+                    ConfigCommands::Init => {
+                        return handle_init();
+                    }
                     ConfigCommands::Install { link } => {
                         return handle_install(link);
+                    }
+                    ConfigCommands::Completions { shell } => {
+                        return handle_completions(shell);
                     }
                 }
             }
@@ -82,13 +131,17 @@ async fn main() -> Result<()> {
     }
 
     // Default behavior: send email
+    // Resolve configuration paths
+    let client_secret = args.client_secret.unwrap_or_else(|| get_config_path("client_secret.json"));
+    let token_cache = args.token_cache.unwrap_or_else(|| get_data_path("token_cache.json"));
+
     // Get email details (from args or prompt)
     let to = get_or_prompt(args.to, "To")?;
     let subject = get_or_prompt(args.subject, "Subject")?;
     let body = get_or_prompt(args.body, "Body")?;
 
     println!("Authenticating with Gmail...");
-    let (client, auth) = create_gmail_client(&args.client_secret, &args.token_cache).await?;
+    let (client, auth) = create_gmail_client(&client_secret, &token_cache).await?;
 
     println!("Building email...");
     let email_message = build_email(&to, &subject, &body, &args.attachment)?;
@@ -99,6 +152,47 @@ async fn main() -> Result<()> {
     println!("✓ Email sent successfully!");
     println!("  Message ID: {}", result.id.unwrap_or_default());
     println!("  Thread ID: {}", result.thread_id.unwrap_or_default());
+
+    Ok(())
+}
+
+/// Handle the init subcommand
+fn handle_init() -> Result<()> {
+    let config_dir = get_config_dir();
+    let data_dir = get_data_dir();
+
+    // Create the config directory
+    if config_dir.exists() {
+        println!("Configuration directory already exists at {:?}", config_dir);
+    } else {
+        fs::create_dir_all(&config_dir)
+            .context(format!("Failed to create directory: {:?}", config_dir))?;
+        println!("✓ Created configuration directory at {:?}", config_dir);
+    }
+
+    // Create the data directory
+    if data_dir.exists() {
+        println!("Data directory already exists at {:?}", data_dir);
+    } else {
+        fs::create_dir_all(&data_dir)
+            .context(format!("Failed to create directory: {:?}", data_dir))?;
+        println!("✓ Created data directory at {:?}", data_dir);
+    }
+
+    // Show expected file locations
+    println!("\nExpected file locations:");
+    println!("  Client Secret: {:?}", get_config_path("client_secret.json"));
+    println!("  Token Cache:   {:?}", get_data_path("token_cache.json"));
+
+    // Check if client_secret.json exists
+    let client_secret_path = get_config_path("client_secret.json");
+    if !client_secret_path.exists() {
+        println!("\n⚠ Warning: client_secret.json not found");
+        println!("  Download it from Google Cloud Console and place it at:");
+        println!("  {:?}", client_secret_path);
+    } else {
+        println!("\n✓ client_secret.json found");
+    }
 
     Ok(())
 }
@@ -157,6 +251,16 @@ fn handle_install(use_link: bool) -> Result<()> {
 
         println!("✓ Installed to {:?}", target_path);
     }
+
+    Ok(())
+}
+
+/// Handle the completions subcommand
+fn handle_completions(shell: Shell) -> Result<()> {
+    let mut cmd = Args::command();
+    let bin_name = cmd.get_name().to_string();
+
+    generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
 
     Ok(())
 }
