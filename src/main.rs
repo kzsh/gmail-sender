@@ -2,23 +2,13 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use dialoguer::Input;
-use google_gmail1::{
-    api::Message,
-    hyper::{
-        self,
-        client::HttpConnector,
-        header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
-        Body, Method, Request,
-    },
-    hyper_rustls::{self, HttpsConnector},
-    oauth2,
+use gmail_sender::{
+    build_email, check_permissions, create_gmail_client, get_config_dir, get_config_path,
+    get_data_dir, get_data_path, send_email, set_secure_dir_permissions,
+    set_secure_file_permissions, validate_header_field, warn_insecure_permissions,
 };
-use rand::Rng;
 use std::fs;
 use std::path::PathBuf;
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 /// A simple CLI tool to send emails via Gmail API
 #[derive(Parser, Debug)]
@@ -85,109 +75,10 @@ enum ConfigCommands {
     },
 }
 
-/// Get the XDG config directory for gmail-sender
-fn get_config_dir() -> PathBuf {
-    let config_home = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .expect("Failed to find home directory")
-                .join(".config")
-        });
-    config_home.join("gmail-sender")
-}
-
-/// Get the XDG data directory for gmail-sender
-fn get_data_dir() -> PathBuf {
-    let data_home = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .expect("Failed to find home directory")
-                .join(".local/share")
-        });
-    data_home.join("gmail-sender")
-}
-
-/// Get a config file path within the XDG config directory
-fn get_config_path(filename: &str) -> PathBuf {
-    get_config_dir().join(filename)
-}
-
-/// Get a data file path within the XDG data directory
-fn get_data_path(filename: &str) -> PathBuf {
-    get_data_dir().join(filename)
-}
-
-/// Validate email header fields to prevent header injection attacks.
-/// Rejects any input containing CR or LF characters.
-fn validate_header_field(value: &str, field_name: &str) -> Result<()> {
-    if value.contains('\r') || value.contains('\n') {
-        anyhow::bail!(
-            "Invalid {}: contains newline characters (potential header injection)",
-            field_name
-        );
-    }
-    Ok(())
-}
-
-/// Set secure permissions on a directory (700 on Unix).
-#[cfg(unix)]
-fn set_secure_dir_permissions(path: &PathBuf) -> Result<()> {
-    let perms = fs::Permissions::from_mode(0o700);
-    fs::set_permissions(path, perms).context(format!("Failed to set permissions on {:?}", path))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_secure_dir_permissions(_path: &PathBuf) -> Result<()> {
-    Ok(())
-}
-
-/// Set secure permissions on a file (600 on Unix).
-#[cfg(unix)]
-fn set_secure_file_permissions(path: &PathBuf) -> Result<()> {
-    let perms = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(path, perms).context(format!("Failed to set permissions on {:?}", path))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_secure_file_permissions(_path: &PathBuf) -> Result<()> {
-    Ok(())
-}
-
-/// Check if a path has secure permissions. Returns (is_secure, current_mode).
-#[cfg(unix)]
-fn check_permissions(path: &PathBuf, expected_mode: u32) -> Result<(bool, u32)> {
-    let metadata = fs::metadata(path).context(format!("Failed to read metadata for {:?}", path))?;
-    let mode = metadata.permissions().mode() & 0o777;
-    Ok((mode == expected_mode, mode))
-}
-
-#[cfg(not(unix))]
-fn check_permissions(_path: &PathBuf, _expected_mode: u32) -> Result<(bool, u32)> {
-    Ok((true, 0))
-}
-
-/// Warn about insecure permissions on sensitive files/directories.
-fn warn_insecure_permissions(path: &PathBuf, expected_mode: u32, description: &str) {
-    if let Ok((is_secure, current_mode)) = check_permissions(path, expected_mode) {
-        if !is_secure {
-            eprintln!(
-                "⚠ Warning: {} has insecure permissions ({:o}, should be {:o})",
-                description, current_mode, expected_mode
-            );
-            eprintln!("  Fix with: chmod {:o} {:?}", expected_mode, path);
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Handle subcommands
     if let Some(command) = args.command {
         match command {
             Commands::Config { config_command } => match config_command {
@@ -207,8 +98,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Default behavior: send email
-    // Resolve configuration paths
     let client_secret = args
         .client_secret
         .unwrap_or_else(|| get_config_path("client_secret.json"));
@@ -216,16 +105,13 @@ async fn main() -> Result<()> {
         .token_cache
         .unwrap_or_else(|| get_data_path("token_cache.json"));
 
-    // Get email details (from args or prompt)
     let to = get_or_prompt(args.to, "To")?;
     let subject = get_or_prompt(args.subject, "Subject")?;
     let body = get_or_prompt(args.body, "Body")?;
 
-    // Validate inputs to prevent header injection
     validate_header_field(&to, "recipient address")?;
     validate_header_field(&subject, "subject")?;
 
-    // Check permissions on sensitive directories/files
     let config_dir = get_config_dir();
     let data_dir = get_data_dir();
     if config_dir.exists() {
@@ -241,7 +127,6 @@ async fn main() -> Result<()> {
     println!("Authenticating with Gmail...");
     let (client, auth) = create_gmail_client(&client_secret, &token_cache).await?;
 
-    // After authentication, ensure token cache has secure permissions
     if token_cache.exists() {
         if let Err(e) = set_secure_file_permissions(&token_cache) {
             eprintln!(
@@ -264,15 +149,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Handle the init subcommand
 fn handle_init() -> Result<()> {
     let config_dir = get_config_dir();
     let data_dir = get_data_dir();
 
-    // Create the config directory
     if config_dir.exists() {
         println!("Configuration directory already exists at {:?}", config_dir);
-        // Check and fix permissions on existing directory
         if let Ok((is_secure, _)) = check_permissions(&config_dir, 0o700) {
             if !is_secure {
                 set_secure_dir_permissions(&config_dir)?;
@@ -289,10 +171,8 @@ fn handle_init() -> Result<()> {
         );
     }
 
-    // Create the data directory
     if data_dir.exists() {
         println!("Data directory already exists at {:?}", data_dir);
-        // Check and fix permissions on existing directory
         if let Ok((is_secure, _)) = check_permissions(&data_dir, 0o700) {
             if !is_secure {
                 set_secure_dir_permissions(&data_dir)?;
@@ -306,7 +186,6 @@ fn handle_init() -> Result<()> {
         println!("✓ Created data directory at {:?} (mode 700)", data_dir);
     }
 
-    // Show expected file locations
     println!("\nExpected file locations:");
     println!(
         "  Client Secret: {:?}",
@@ -314,7 +193,6 @@ fn handle_init() -> Result<()> {
     );
     println!("  Token Cache:   {:?}", get_data_path("token_cache.json"));
 
-    // Check if client_secret.json exists
     let client_secret_path = get_config_path("client_secret.json");
     if !client_secret_path.exists() {
         println!("\n⚠ Warning: client_secret.json not found");
@@ -327,7 +205,6 @@ fn handle_init() -> Result<()> {
     Ok(())
 }
 
-/// Handle the check subcommand
 fn handle_check() -> Result<()> {
     let config_dir = get_config_dir();
     let data_dir = get_data_dir();
@@ -338,7 +215,6 @@ fn handle_check() -> Result<()> {
 
     println!("Checking gmail-sender configuration...\n");
 
-    // Check config directory
     print!("Config directory ({:?}): ", config_dir);
     if config_dir.exists() {
         match check_permissions(&config_dir, 0o700) {
@@ -355,7 +231,6 @@ fn handle_check() -> Result<()> {
         all_ok = false;
     }
 
-    // Check data directory
     print!("Data directory ({:?}): ", data_dir);
     if data_dir.exists() {
         match check_permissions(&data_dir, 0o700) {
@@ -372,7 +247,6 @@ fn handle_check() -> Result<()> {
         all_ok = false;
     }
 
-    // Check client_secret.json existence
     print!("\nClient secret ({:?}): ", client_secret_path);
     if !client_secret_path.exists() {
         println!("✗ not found");
@@ -380,50 +254,44 @@ fn handle_check() -> Result<()> {
         println!("  and save as {:?}", client_secret_path);
         all_ok = false;
     } else {
-        // Validate the JSON structure
         match fs::read_to_string(&client_secret_path) {
-            Ok(content) => {
-                match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(json) => {
-                        // Check for required fields in OAuth2 client secret
-                        let has_installed = json.get("installed").is_some();
-                        let has_web = json.get("web").is_some();
+            Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(json) => {
+                    let has_installed = json.get("installed").is_some();
+                    let has_web = json.get("web").is_some();
 
-                        if has_installed || has_web {
-                            let client_type = if has_installed {
-                                json.get("installed")
+                    if has_installed || has_web {
+                        let client_type = if has_installed {
+                            json.get("installed")
+                        } else {
+                            json.get("web")
+                        };
+
+                        if let Some(client) = client_type {
+                            let has_client_id = client.get("client_id").is_some();
+                            let has_client_secret = client.get("client_secret").is_some();
+
+                            if has_client_id && has_client_secret {
+                                println!("✓ valid");
                             } else {
-                                json.get("web")
-                            };
-
-                            if let Some(client) = client_type {
-                                let has_client_id = client.get("client_id").is_some();
-                                let has_client_secret = client.get("client_secret").is_some();
-
-                                if has_client_id && has_client_secret {
-                                    println!("✓ valid");
-                                } else {
-                                    println!("✗ invalid (missing client_id or client_secret)");
-                                    all_ok = false;
-                                }
-                            } else {
-                                println!("✗ invalid structure");
+                                println!("✗ invalid (missing client_id or client_secret)");
                                 all_ok = false;
                             }
                         } else {
-                            println!("✗ invalid (missing 'installed' or 'web' section)");
-                            println!(
-                                "  Make sure you downloaded a Desktop app or Web app credential"
-                            );
+                            println!("✗ invalid structure");
                             all_ok = false;
                         }
-                    }
-                    Err(e) => {
-                        println!("✗ invalid JSON: {}", e);
+                    } else {
+                        println!("✗ invalid (missing 'installed' or 'web' section)");
+                        println!("  Make sure you downloaded a Desktop app or Web app credential");
                         all_ok = false;
                     }
                 }
-            }
+                Err(e) => {
+                    println!("✗ invalid JSON: {}", e);
+                    all_ok = false;
+                }
+            },
             Err(e) => {
                 println!("✗ cannot read: {}", e);
                 all_ok = false;
@@ -431,7 +299,6 @@ fn handle_check() -> Result<()> {
         }
     }
 
-    // Check token cache (optional, just informational)
     print!("\nToken cache ({:?}): ", token_cache_path);
     if token_cache_path.exists() {
         match check_permissions(&token_cache_path, 0o600) {
@@ -462,9 +329,7 @@ fn handle_check() -> Result<()> {
     }
 }
 
-/// Handle the install subcommand
 fn handle_install(use_link: bool) -> Result<()> {
-    // Get the current executable path
     let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
 
     let exe_name = current_exe
@@ -472,40 +337,33 @@ fn handle_install(use_link: bool) -> Result<()> {
         .context("Failed to get executable name")?;
 
     if use_link {
-        // Symlink to ~/.local/bin/
         let home = std::env::var("HOME").context("HOME environment variable not set")?;
         let target_dir = PathBuf::from(home).join(".local/bin");
 
-        // Create directory if it doesn't exist
         fs::create_dir_all(&target_dir)
             .context(format!("Failed to create directory: {:?}", target_dir))?;
 
         let target_path = target_dir.join(exe_name);
 
-        // Remove existing symlink/file if it exists
         if target_path.exists() {
             fs::remove_file(&target_path)
                 .context(format!("Failed to remove existing file: {:?}", target_path))?;
         }
 
-        // Create symlink
         std::os::unix::fs::symlink(&current_exe, &target_path)
             .context(format!("Failed to create symlink to {:?}", target_path))?;
 
         println!("✓ Symlinked to {:?}", target_path);
         println!("  Make sure {:?} is in your PATH", target_dir);
     } else {
-        // Copy to /usr/local/bin/
         let target_dir = PathBuf::from("/usr/local/bin");
         let target_path = target_dir.join(exe_name);
 
-        // Copy the executable
         fs::copy(&current_exe, &target_path).context(format!(
             "Failed to copy to {:?}. You may need to run with sudo.",
             target_path
         ))?;
 
-        // Make executable (set permissions to 755)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -520,7 +378,6 @@ fn handle_install(use_link: bool) -> Result<()> {
     Ok(())
 }
 
-/// Handle the completions subcommand
 fn handle_completions(shell: Shell) -> Result<()> {
     let mut cmd = Args::command();
     let bin_name = cmd.get_name().to_string();
@@ -530,7 +387,6 @@ fn handle_completions(shell: Shell) -> Result<()> {
     Ok(())
 }
 
-/// Get value from Option or prompt user interactively
 fn get_or_prompt(value: Option<String>, field_name: &str) -> Result<String> {
     match value {
         Some(v) => Ok(v),
@@ -539,200 +395,4 @@ fn get_or_prompt(value: Option<String>, field_name: &str) -> Result<String> {
             .interact_text()
             .context(format!("Failed to read {}", field_name)),
     }
-}
-
-/// Create authenticated HTTP client and authenticator
-async fn create_gmail_client(
-    client_secret_path: &PathBuf,
-    token_cache_path: &PathBuf,
-) -> Result<(
-    hyper::Client<HttpsConnector<HttpConnector>>,
-    oauth2::authenticator::Authenticator<HttpsConnector<HttpConnector>>,
-)> {
-    // Read client secret
-    let secret = oauth2::read_application_secret(client_secret_path)
-        .await
-        .context(
-            "Failed to read client secret file. Did you download it from Google Cloud Console?",
-        )?;
-
-    // Create authenticator with token persistence
-    let auth = oauth2::InstalledFlowAuthenticator::builder(
-        secret,
-        oauth2::InstalledFlowReturnMethod::HTTPRedirect,
-    )
-    .persist_tokens_to_disk(token_cache_path)
-    .build()
-    .await
-    .context("Failed to create authenticator")?;
-
-    // Create HTTP client
-    let client = hyper::Client::builder().build(
-        hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .context("Failed to load native root certificates")?
-            .https_or_http()
-            .enable_http1()
-            .build(),
-    );
-
-    Ok((client, auth))
-}
-
-/// Send email via direct HTTP POST to Gmail API
-async fn send_email(
-    client: &hyper::Client<HttpsConnector<HttpConnector>>,
-    auth: &oauth2::authenticator::Authenticator<HttpsConnector<HttpConnector>>,
-    message: Message,
-) -> Result<Message> {
-    // Get access token
-    let token = auth
-        .token(&["https://www.googleapis.com/auth/gmail.send"])
-        .await
-        .context("Failed to get access token")?;
-
-    // Serialize message to JSON
-    let json_body =
-        serde_json::to_string(&message).context("Failed to serialize message to JSON")?;
-
-    // Extract the token string
-    let token_str = token
-        .token()
-        .context("No access token available in response")?;
-
-    // Build HTTP request
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
-        .header(AUTHORIZATION, format!("Bearer {}", token_str))
-        .header(CONTENT_TYPE, "application/json")
-        .header(USER_AGENT, "gmail-sender/0.1.0")
-        .body(Body::from(json_body))
-        .context("Failed to build HTTP request")?;
-
-    // Send request
-    let resp = client
-        .request(req)
-        .await
-        .context("Failed to send HTTP request")?;
-
-    // Check response status
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
-        let body_str = String::from_utf8_lossy(&body_bytes);
-        anyhow::bail!(
-            "Gmail API request failed with status {}: {}",
-            status,
-            body_str
-        );
-    }
-
-    // Parse response
-    let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
-    let result: Message =
-        serde_json::from_slice(&body_bytes).context("Failed to parse response JSON")?;
-
-    Ok(result)
-}
-
-/// Generate a random MIME boundary string.
-fn generate_boundary() -> String {
-    let mut rng = rand::thread_rng();
-    let random_bytes: [u8; 16] = rng.gen();
-    format!(
-        "boundary_{}",
-        random_bytes
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
-    )
-}
-
-/// Build email message with optional attachments
-fn build_email(
-    to: &str,
-    subject: &str,
-    body: &str,
-    attachments: &[PathBuf],
-    verbose: bool,
-) -> Result<Message> {
-    let boundary = generate_boundary();
-
-    // Build headers - RFC822 requires CRLF line endings
-    let mut headers = vec![
-        format!("From: me"), // Gmail API will replace 'me' with authenticated user
-        format!("To: {}", to),
-        format!("Subject: {}", subject),
-        "MIME-Version: 1.0".to_string(),
-    ];
-
-    // Build body
-    let mut email_body = String::new();
-
-    if attachments.is_empty() {
-        // Simple plain text email
-        headers.push("Content-Type: text/plain; charset=UTF-8".to_string());
-        email_body = body.to_string();
-    } else {
-        // Multipart email with attachments
-        headers.push(format!(
-            "Content-Type: multipart/mixed; boundary=\"{}\"",
-            boundary
-        ));
-
-        // Text part
-        email_body.push_str(&format!("--{}\r\n", boundary));
-        email_body.push_str("Content-Type: text/plain; charset=UTF-8\r\n\r\n");
-        email_body.push_str(body);
-        email_body.push_str("\r\n\r\n");
-
-        // Attachment parts
-        for attachment_path in attachments {
-            let filename = attachment_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .context("Invalid attachment filename")?;
-
-            let file_data = fs::read(attachment_path)
-                .context(format!("Failed to read attachment: {:?}", attachment_path))?;
-
-            let mime_type = mime_guess::from_path(attachment_path)
-                .first_or_octet_stream()
-                .to_string();
-
-            let encoded_data =
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &file_data);
-
-            email_body.push_str(&format!("--{}\r\n", boundary));
-            email_body.push_str(&format!("Content-Type: {}\r\n", mime_type));
-            email_body.push_str(&format!(
-                "Content-Disposition: attachment; filename=\"{}\"\r\n",
-                filename
-            ));
-            email_body.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
-            email_body.push_str(&encoded_data);
-            email_body.push_str("\r\n\r\n");
-        }
-
-        email_body.push_str(&format!("--{}--", boundary));
-    }
-
-    // Combine headers and body with CRLF line endings (RFC822)
-    let raw_email = format!("{}\r\n\r\n{}", headers.join("\r\n"), email_body);
-
-    // Debug: print the raw email (only in verbose mode)
-    if verbose {
-        eprintln!("DEBUG - Raw email:");
-        eprintln!("{}", raw_email.replace("\r\n", "\\r\\n\n"));
-        eprintln!("---");
-    }
-
-    // IMPORTANT: Don't base64 encode ourselves!
-    // The Message struct's `raw` field has a serde attribute that will automatically
-    // base64url-encode the Vec<u8> during JSON serialization
-    Ok(Message {
-        raw: Some(raw_email.into_bytes()),
-        ..Default::default()
-    })
 }
