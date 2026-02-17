@@ -2,6 +2,7 @@
 name = "gmail-sender"
 version = "0.1.0"
 edition = "2021"
+publish = ["arx"]  # Only allow publishing to kellnr
 
 [dependencies]
 google-gmail1 = "5.0.5"
