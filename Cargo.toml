@@ -1,8 +1,21 @@
 [package]
 name = "gmail-sender"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-publish = ["arx"]  # Only allow publishing to kellnr
+description = "Send emails via Gmail API with OAuth2 authentication"
+license = "MIT"
+readme = "README.md"
+keywords = ["gmail", "email", "oauth2", "google"]
+categories = ["email", "api-bindings"]
+publish = ["arx"]
+
+[lib]
+name = "gmail_sender"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gmail-sender"
+path = "src/main.rs"
 
 [dependencies]
 google-gmail1 = "5.0.5"
