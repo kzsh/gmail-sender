@@ -1,29 +1,3 @@
-//! A library for sending emails via the Gmail API.
-//!
-//! This crate provides functions for OAuth2 authentication with Gmail and
-//! building/sending RFC822-compliant email messages.
-//!
-//! # Example
-//!
-//! ```no_run
-//! use gmail_sender::{create_gmail_client, build_email, send_email};
-//! use std::path::PathBuf;
-//!
-//! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
-//!     let client_secret = PathBuf::from("client_secret.json");
-//!     let token_cache = PathBuf::from("token_cache.json");
-//!
-//!     let (client, auth) = create_gmail_client(&client_secret, &token_cache).await?;
-//!
-//!     let message = build_email("user@example.com", "Hello", "Email body", &[], false)?;
-//!     let result = send_email(&client, &auth, message).await?;
-//!
-//!     println!("Sent! Message ID: {:?}", result.id);
-//!     Ok(())
-//! }
-//! ```
-
 use anyhow::{Context, Result};
 use google_gmail1::{
     api::Message,
@@ -207,36 +181,57 @@ pub async fn create_gmail_client(
     Ok((client, auth))
 }
 
-/// Send email via direct HTTP POST to Gmail API.
+/// Create an HTTP client suitable for Gmail API requests.
 ///
-/// Uses the `gmail.send` scope to send the message. The message should
-/// be built using [`build_email`].
+/// This is useful when you want to manage authentication yourself using
+/// [`send_email_with_token`] instead of the authenticator-based [`send_email`].
 ///
 /// # Errors
 ///
-/// Returns an error if the access token cannot be obtained or if the
-/// Gmail API request fails.
-pub async fn send_email(
+/// Returns an error if native root certificates cannot be loaded.
+pub fn create_http_client() -> Result<GmailHttpClient> {
+    let client = hyper::Client::builder().build(
+        hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .context("Failed to load native root certificates")?
+            .https_or_http()
+            .enable_http1()
+            .build(),
+    );
+    Ok(client)
+}
+
+/// Send email via direct HTTP POST to Gmail API using a bearer token.
+///
+/// This function allows callers to manage their own authentication and
+/// pass in a pre-obtained OAuth2 access token. This is useful when:
+/// - Integrating with an existing auth system
+/// - Using service account credentials obtained elsewhere
+/// - The downstream application manages token lifecycle
+///
+/// The token must have the `gmail.send` scope.
+///
+/// # Arguments
+///
+/// * `client` - HTTP client (create with [`create_http_client`])
+/// * `token` - OAuth2 bearer token with `gmail.send` scope
+/// * `message` - Email message built using [`build_email`]
+///
+/// # Errors
+///
+/// Returns an error if the Gmail API request fails.
+pub async fn send_email_with_token(
     client: &GmailHttpClient,
-    auth: &GmailAuthenticator,
+    token: &str,
     message: Message,
 ) -> Result<Message> {
-    let token = auth
-        .token(&["https://www.googleapis.com/auth/gmail.send"])
-        .await
-        .context("Failed to get access token")?;
-
     let json_body =
         serde_json::to_string(&message).context("Failed to serialize message to JSON")?;
-
-    let token_str = token
-        .token()
-        .context("No access token available in response")?;
 
     let req = Request::builder()
         .method(Method::POST)
         .uri("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
-        .header(AUTHORIZATION, format!("Bearer {}", token_str))
+        .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/json")
         .header(USER_AGENT, "gmail-sender/0.1.0")
         .body(Body::from(json_body))
@@ -263,6 +258,35 @@ pub async fn send_email(
         serde_json::from_slice(&body_bytes).context("Failed to parse response JSON")?;
 
     Ok(result)
+}
+
+/// Send email via direct HTTP POST to Gmail API.
+///
+/// Uses the `gmail.send` scope to send the message. The message should
+/// be built using [`build_email`].
+///
+/// If you want to manage authentication yourself (e.g., using service accounts
+/// or tokens from an external auth system), use [`send_email_with_token`] instead.
+///
+/// # Errors
+///
+/// Returns an error if the access token cannot be obtained or if the
+/// Gmail API request fails.
+pub async fn send_email(
+    client: &GmailHttpClient,
+    auth: &GmailAuthenticator,
+    message: Message,
+) -> Result<Message> {
+    let token = auth
+        .token(&["https://www.googleapis.com/auth/gmail.send"])
+        .await
+        .context("Failed to get access token")?;
+
+    let token_str = token
+        .token()
+        .context("No access token available in response")?;
+
+    send_email_with_token(client, token_str, message).await
 }
 
 /// Generate a random MIME boundary string.

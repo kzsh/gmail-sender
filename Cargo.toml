@@ -1,6 +1,6 @@
 [package]
 name = "gmail-sender"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Send emails via Gmail API with OAuth2 authentication"
 license = "MIT"
