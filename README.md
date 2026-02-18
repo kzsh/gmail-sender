@@ -2,7 +2,6 @@
 
 A simple command-line tool to send emails via Gmail API using Rust and google-apis-rs.
 
-
 ## Features
 
 - OAuth2 authentication (installed app flow)
